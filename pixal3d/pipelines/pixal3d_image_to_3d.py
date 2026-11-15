@@ -1,4 +1,6 @@
 from typing import *
+import os
+import time
 import torch
 import torch.nn as nn
 import numpy as np
@@ -8,6 +10,8 @@ from . import samplers, rembg
 from ..modules.sparse import SparseTensor
 from ..modules import image_feature_extractor
 from ..representations import Mesh, MeshWithVoxel
+
+_TIMING = int(os.environ.get("PIXAL_TIMING", "0"))
 
 
 class Pixal3DImageTo3DPipeline(Pipeline):
@@ -82,6 +86,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         self.image_cond_model_tex_1024 = image_cond_model_tex_1024
         self.rembg_model = rembg_model
         self.low_vram = low_vram
+        self.smart_vram = False
         self.default_pipeline_type = default_pipeline_type
         self.pbr_attr_layout = {
             'base_color': slice(0, 3),
@@ -123,6 +128,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(**args['rembg_model']['args'])
         
         pipeline.low_vram = args.get('low_vram', True)
+        pipeline.smart_vram = False
         pipeline.default_pipeline_type = args.get('default_pipeline_type', '1024_cascade')
         pipeline.pbr_attr_layout = {
             'base_color': slice(0, 3),
@@ -131,8 +137,26 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             'alpha': slice(5, 6),
         }
         pipeline._device = 'cpu'
+        pipeline._repo_path = path
 
         return pipeline
+
+    def _reload_missing_models(self):
+        """Re-load checkpoints removed from self.models during smart_vram streaming."""
+        if not getattr(self, 'smart_vram', False):
+            return
+        if not hasattr(self, '_pretrained_args'):
+            return
+        from .. import models as model_zoo
+        repo = getattr(self, '_repo_path', 'TencentARC/Pixal3D')
+        for key, rel_path in self._pretrained_args['models'].items():
+            if key in self.models:
+                continue
+            print(f"[Pipeline] Reloading {key} (smart_vram)...")
+            try:
+                self.models[key] = model_zoo.from_pretrained(f"{repo}/{rel_path}")
+            except Exception:
+                self.models[key] = model_zoo.from_pretrained(rel_path)
 
     def to(self, device: torch.device) -> None:
         self._device = device
@@ -163,10 +187,10 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             output = input
         else:
             input = input.convert('RGB')
-            if self.low_vram:
+            if self.low_vram and not self.smart_vram:
                 self.rembg_model.to(self.device)
             output = self.rembg_model(input)
-            if self.low_vram:
+            if self.low_vram and not self.smart_vram:
                 self.rembg_model.cpu()
         output_np = np.array(output)
         alpha = output_np[:, :, 3]
@@ -211,7 +235,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         """
         device = self.device
         image_cond_model = self.image_cond_model_ss
-        if self.low_vram:
+        if self.low_vram and not self.smart_vram:
             image_cond_model.to(device)
         cam_angle = torch.tensor([camera_angle_x], device=device)
         dist_tensor = torch.tensor([distance], device=device)
@@ -219,7 +243,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         z_global, z_proj = image_cond_model(
             image, camera_angle_x=cam_angle, distance=dist_tensor, mesh_scale=scale_tensor,
         )
-        if self.low_vram:
+        if self.low_vram and not self.smart_vram:
             image_cond_model.cpu()
         return {
             'cond': {'global': z_global, 'proj': z_proj},
@@ -236,7 +260,9 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         distance: float = 2.0,
         mesh_scale: float = 1.0,
         grid_resolution_override: int = None,
-    ) -> dict:
+        cached_z: Optional[torch.Tensor] = None,
+        return_z: bool = False,
+    ):
         """
         Get proj conditioning for shape/texture stages (sparse-token aligned).
 
@@ -248,12 +274,20 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             distance: Camera distance.
             mesh_scale: Mesh scale.
             grid_resolution_override: Override the grid resolution if not None.
+            cached_z: Pre-computed DINOv3 backbone hidden states [B, tokens, D].
+                If provided, the expensive ViT-L forward pass is skipped.
+                Safe to reuse only when the same frozen model weights and same
+                image (size+content) would produce identical features.
+            return_z: If True, return (cond_dict, z) instead of cond_dict.
+                Use together with cached_z to share features across stages.
 
         Returns:
-            dict with 'cond' and 'neg_cond', each containing {'global': ..., 'proj': SparseTensor}
+            If return_z is False: dict with 'cond' and 'neg_cond'.
+            If return_z is True: (dict, z_tensor) where z_tensor can be passed
+                as cached_z to a subsequent call.
         """
         device = self.device
-        if self.low_vram:
+        if self.low_vram and not self.smart_vram:
             image_cond_model.to(device)
 
         orig_grid_res = image_cond_model.grid_resolution
@@ -269,7 +303,11 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         dist_tensor = torch.tensor([distance], device=device)
         scale_tensor = torch.tensor([mesh_scale], device=device)
         z_global, z_proj = image_cond_model(
-            image, camera_angle_x=cam_angle, distance=dist_tensor, mesh_scale=scale_tensor,
+            image,
+            camera_angle_x=cam_angle,
+            distance=dist_tensor,
+            mesh_scale=scale_tensor,
+            cached_z=cached_z,
         )
         grid_res = image_cond_model.grid_resolution
         z_proj_grid = z_proj.reshape(B, grid_res, grid_res, grid_res, -1)
@@ -287,12 +325,18 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                 image_resolution=image_cond_model.proj_grid.image_resolution,
             ).to(device)
 
-        if self.low_vram:
+        if self.low_vram and not self.smart_vram:
             image_cond_model.cpu()
-        return {
+
+        cond_dict = {
             'cond': {'global': z_global, 'proj': z_proj_st},
             'neg_cond': {'global': torch.zeros_like(z_global), 'proj': SparseTensor(feats=torch.zeros_like(z_proj_sparse), coords=coords)},
         }
+        if return_z:
+            # Return the raw backbone tensor so caller can pass it as cached_z.
+            # image_cond_model stores it as _last_z after the forward call.
+            return cond_dict, image_cond_model._last_z
+        return cond_dict, None
 
     # =========================================================================
     # Sampling methods (consistent with Trellis2)
@@ -331,14 +375,18 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             tqdm_desc="Sampling sparse structure (proj)",
         ).samples
         if self.low_vram:
-            flow_model.cpu()
-        
+            if self.smart_vram:
+                del self.models['sparse_structure_flow_model'], flow_model
+                torch.cuda.empty_cache()
+            else:
+                flow_model.cpu()
+
         # Decode sparse structure latent
         decoder = self.models['sparse_structure_decoder']
-        if self.low_vram:
+        if self.low_vram and not self.smart_vram:
             decoder.to(self.device)
-        decoded = decoder(z_s)>0
-        if self.low_vram:
+        decoded = decoder(z_s) > 0
+        if self.low_vram and not self.smart_vram:
             decoder.cpu()
         if resolution != decoded.shape[2]:
             ratio = decoded.shape[2] // resolution
@@ -379,14 +427,22 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             tqdm_desc="Sampling shape SLat (proj)",
         ).samples
         if self.low_vram:
-            flow_model.cpu()
+            if self.smart_vram:
+                # Identify and delete this flow model by identity to free VRAM.
+                _key = next((k for k, v in self.models.items() if v is flow_model), None)
+                if _key:
+                    del self.models[_key]
+                del flow_model
+                torch.cuda.empty_cache()
+            else:
+                flow_model.cpu()
 
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat.device)
         slat = slat * std + mean
-        
+
         return slat
-    
+
     def sample_shape_slat_cascade(
         self,
         lr_cond: dict,
@@ -498,12 +554,16 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             List[SparseTensor]: The decoded substructures.
         """
         self.models['shape_slat_decoder'].set_resolution(resolution)
-        if self.low_vram:
+        if self.low_vram and not self.smart_vram:
             self.models['shape_slat_decoder'].to(self.device)
             self.models['shape_slat_decoder'].low_vram = True
+        elif self.low_vram and self.smart_vram:
+            self.models['shape_slat_decoder'].low_vram = True
         ret = self.models['shape_slat_decoder'](slat, return_subs=True)
-        if self.low_vram:
+        if self.low_vram and not self.smart_vram:
             self.models['shape_slat_decoder'].cpu()
+            self.models['shape_slat_decoder'].low_vram = False
+        elif self.low_vram and self.smart_vram:
             self.models['shape_slat_decoder'].low_vram = False
         return ret
     
@@ -542,7 +602,14 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             tqdm_desc="Sampling texture SLat (proj)",
         ).samples
         if self.low_vram:
-            flow_model.cpu()
+            if self.smart_vram:
+                _key = next((k for k, v in self.models.items() if v is flow_model), None)
+                if _key:
+                    del self.models[_key]
+                del flow_model
+                torch.cuda.empty_cache()
+            else:
+                flow_model.cpu()
 
         std = torch.tensor(self.tex_slat_normalization['std'])[None].to(slat.device)
         mean = torch.tensor(self.tex_slat_normalization['mean'])[None].to(slat.device)
@@ -564,10 +631,10 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         Returns:
             SparseTensor: The decoded texture voxels
         """
-        if self.low_vram:
+        if self.low_vram and not self.smart_vram:
             self.models['tex_slat_decoder'].to(self.device)
         ret = self.models['tex_slat_decoder'](slat, guide_subs=subs) * 0.5 + 0.5
-        if self.low_vram:
+        if self.low_vram and not self.smart_vram:
             self.models['tex_slat_decoder'].cpu()
         return ret
     
@@ -639,6 +706,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             pipeline_type (str): The type of the pipeline. Options: '1024_cascade', '1536_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
         """
+        self._reload_missing_models()
+
         # Check pipeline type
         pipeline_type = pipeline_type or self.default_pipeline_type
         if pipeline_type == '1024_cascade':
@@ -669,6 +738,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         if preprocess_image:
             image = self.preprocess_image(image)
         torch.manual_seed(seed)
+        _t_run = time.perf_counter()
 
         # ---- Stage 1: Sparse Structure (proj) ----
         cond_ss = self.get_proj_cond_ss(
@@ -686,7 +756,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         torch.cuda.empty_cache()
 
         # ---- Stage 2: Shape LR 512 (proj) ----
-        cond_shape_lr = self.get_proj_cond_shape(
+        cond_shape_lr, _ = self.get_proj_cond_shape(
             self.image_cond_model_shape_512, [image], coords,
             camera_angle_x=camera_angle_x,
             distance=distance,
@@ -698,14 +768,21 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         )
         del cond_shape_lr
         torch.cuda.empty_cache()
+        if _TIMING:
+            print(f"[TIMING]   stage1+2_ss_shapelr={time.perf_counter()-_t_run:.1f}s", flush=True)
+            _t_run = time.perf_counter()
 
         # ---- Stage 3a: Upsample LR → HR ----
-        if self.low_vram:
+        if self.low_vram and not self.smart_vram:
             self.models['shape_slat_decoder'].to(self.device)
             self.models['shape_slat_decoder'].low_vram = True
+        elif self.low_vram and self.smart_vram:
+            self.models['shape_slat_decoder'].low_vram = True
         hr_coords = self.models['shape_slat_decoder'].upsample(lr_slat, upsample_times=4)
-        if self.low_vram:
+        if self.low_vram and not self.smart_vram:
             self.models['shape_slat_decoder'].cpu()
+            self.models['shape_slat_decoder'].low_vram = False
+        elif self.low_vram and self.smart_vram:
             self.models['shape_slat_decoder'].low_vram = False
 
         lr_resolution = 512
@@ -722,18 +799,29 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                 break
             actual_hr_resolution -= 128
 
+
         actual_grid_res = actual_hr_resolution // 16
         del lr_slat, hr_coords, quant_coords
         torch.cuda.empty_cache()
+        if _TIMING:
+            print(f"[TIMING]   stage3a_upsample={time.perf_counter()-_t_run:.1f}s", flush=True)
+            _t_run = time.perf_counter()
 
         # ---- Stage 3b: Shape HR (proj) ----
-        cond_shape_hr = self.get_proj_cond_shape(
+        # Pass return_z=True so we can reuse the frozen DINOv3 backbone output
+        # in the texture stage below (same image, same image_size=1024, same weights).
+        cond_shape_hr, _cached_dino_z = self.get_proj_cond_shape(
             self.image_cond_model_shape_1024, [image], hr_coords_unique,
             camera_angle_x=camera_angle_x,
             distance=distance,
             mesh_scale=mesh_scale,
             grid_resolution_override=actual_grid_res,
+            return_z=True,
         )
+        if _TIMING:
+            torch.cuda.synchronize()
+            print(f"[TIMING]   stage3b_cond={time.perf_counter()-_t_run:.1f}s", flush=True)
+            _t_run = time.perf_counter()
         noise_hr = SparseTensor(
             feats=torch.randn(hr_coords_unique.shape[0], self.models['shape_slat_flow_model_1024'].in_channels).to(self.device),
             coords=hr_coords_unique,
@@ -741,7 +829,12 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         sampler_params_hr = {**self.shape_slat_sampler_params, **shape_slat_sampler_params}
         flow_model_hr = self.models['shape_slat_flow_model_1024']
         if self.low_vram:
+            if _TIMING:
+                _t_load = time.perf_counter()
             flow_model_hr.to(self.device)
+            if _TIMING:
+                torch.cuda.synchronize()
+                print(f"[TIMING]   stage3b_dit_load={time.perf_counter()-_t_load:.1f}s", flush=True)
         hr_slat = self.shape_slat_sampler.sample(
             flow_model_hr,
             noise_hr,
@@ -751,32 +844,55 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             tqdm_desc=f"Sampling HR shape SLat (proj, {actual_hr_resolution})",
         ).samples
         if self.low_vram:
-            flow_model_hr.cpu()
+            if self.smart_vram:
+                del self.models['shape_slat_flow_model_1024'], flow_model_hr
+                torch.cuda.empty_cache()
+            else:
+                flow_model_hr.cpu()
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(hr_slat.device)
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(hr_slat.device)
         shape_slat = hr_slat * std + mean
         del cond_shape_hr, noise_hr, hr_slat, hr_coords_unique
         torch.cuda.empty_cache()
+        if _TIMING:
+            torch.cuda.synchronize()
+            print(f"[TIMING]   stage3b_sample={time.perf_counter()-_t_run:.1f}s", flush=True)
+            _t_run = time.perf_counter()
 
         # ---- Stage 4: Texture (proj) ----
+        # Reuse the DINOv3 backbone features cached from stage 3b (bit-for-bit
+        # identical: same frozen model, same 1024 image, same image_size=1024).
+        # Only the NAF target (1024 vs 512) and the per-coord gather differ.
         tex_grid_res = actual_hr_resolution // 16
-        cond_tex = self.get_proj_cond_shape(
+        cond_tex, _ = self.get_proj_cond_shape(
             self.image_cond_model_tex_1024, [image], shape_slat.coords,
             camera_angle_x=camera_angle_x,
             distance=distance,
             mesh_scale=mesh_scale,
             grid_resolution_override=tex_grid_res,
+            cached_z=_cached_dino_z,
         )
+        del _cached_dino_z
+        if _TIMING:
+            torch.cuda.synchronize()
+            print(f"[TIMING]   stage4_cond={time.perf_counter()-_t_run:.1f}s", flush=True)
+            _t_run = time.perf_counter()
         tex_slat = self.sample_tex_slat(
             cond_tex, self.models['tex_slat_flow_model_1024'],
             shape_slat, tex_slat_sampler_params
         )
         del cond_tex
         torch.cuda.empty_cache()
+        if _TIMING:
+            torch.cuda.synchronize()
+            print(f"[TIMING]   stage4_sample={time.perf_counter()-_t_run:.1f}s", flush=True)
+            _t_run = time.perf_counter()
 
         # ---- Stage 5: Decode ----
         res = actual_hr_resolution
         out_mesh = self.decode_latent(shape_slat, tex_slat, res)
+        if _TIMING:
+            print(f"[TIMING]   stage5_decode={time.perf_counter()-_t_run:.1f}s", flush=True)
         if return_latent:
             return out_mesh, (shape_slat, tex_slat, res)
         else:
