@@ -99,8 +99,16 @@ class Pixal3DMVImageTo3DPipeline(Pixal3DImageTo3DPipeline):
         distance=None,
         mesh_scale=1.0,
         grid_resolution_override: int = None,
-    ) -> dict:
-        """Multi-view proj conditioning for the shape / texture stages (sparse tokens)."""
+        cached_z=None,
+        return_z: bool = False,
+    ):
+        """Multi-view proj conditioning for the shape / texture stages (sparse tokens).
+
+        Matches the single-view signature of the ROCm port: returns (cond_dict, None).
+        cached_z / return_z (single-view DINOv3 feature reuse between the shape-HR and
+        texture stages) are accepted but not used: the multi-view extractor runs per view,
+        so the features are recomputed each stage.
+        """
         views = self._views_of(image)
         device = self.device
         if self.low_vram:
@@ -146,7 +154,7 @@ class Pixal3DMVImageTo3DPipeline(Pixal3DImageTo3DPipeline):
                 'global': torch.zeros_like(z_global),
                 'proj': SparseTensor(feats=torch.zeros_like(z_proj_sparse), coords=coords),
             },
-        }
+        }, None
 
     @torch.no_grad()
     def run_mv(self, views: dict, **kwargs):

@@ -24,3 +24,7 @@ env/
 Thumbs.db
 
 tmp
+
+# rocm-gfx1151/run_pixal.sh output
+run.log
+vram.log
