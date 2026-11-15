@@ -1,0 +1,155 @@
+diff --git a/csrc/common/cudaraster/impl/Util.inl b/csrc/common/cudaraster/impl/Util.inl
+index f8faeba..010a7e4 100644
+--- a/csrc/common/cudaraster/impl/Util.inl
++++ b/csrc/common/cudaraster/impl/Util.inl
+@@ -20,6 +20,68 @@ __device__ __inline__ U32   getHi                   (U64 a)                 { re
+ __device__ __inline__ S32   getHi                   (S64 a)                 { return __double2hiint(__longlong_as_double(a)); }
+ __device__ __inline__ U64   combineLoHi             (U32 lo, U32 hi)        { return __double_as_longlong(__hiloint2double(hi, lo)); }
+ __device__ __inline__ S64   combineLoHi             (S32 lo, S32 hi)        { return __double_as_longlong(__hiloint2double(hi, lo)); }
++#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
++// ---- ROCm port: C++/HIP versions of the PTX-asm helpers above (same semantics as the PTX ISA) ----
++__device__ __forceinline__ S32 nvdr_s16lo(U32 x) { return (S32)(S16)(x & 0xffffu); }
++__device__ __forceinline__ S32 nvdr_s16hi(U32 x) { return (S32)(S16)(x >> 16); }
++__device__ __forceinline__ U32 nvdr_byte(U32 x, int n) { return (x >> (8 * n)) & 0xffu; }
++__device__ __inline__ U32   getLaneMaskLt           (void)                  { return (U32)__lanemask_lt(); }
++__device__ __inline__ U32   getLaneMaskLe           (void)                  { return (U32)(__lanemask_lt() | __lanemask_eq()); }
++__device__ __inline__ U32   getLaneMaskGt           (void)                  { return (U32)__lanemask_gt(); }
++__device__ __inline__ U32   getLaneMaskGe           (void)                  { return (U32)(__lanemask_gt() | __lanemask_eq()); }
++__device__ __inline__ int   findLeadingOne          (U32 v)                 { return v ? 31 - __clz(v) : -1; }
++__device__ __inline__ S32   f32_to_s32_sat          (F32 a)                 { if (isnan(a)) return 0; F32 r = rintf(a); return r >= 2147483648.f ? 0x7fffffff : r <= -2147483648.f ? (S32)0x80000000 : (S32)r; }
++__device__ __inline__ U32   f32_to_u32_sat          (F32 a)                 { if (isnan(a)) return 0; F32 r = rintf(a); return r <= 0.f ? 0u : r >= 4294967296.f ? 0xffffffffu : (U32)r; }
++__device__ __inline__ U32   f32_to_u32_sat_rmi      (F32 a)                 { if (isnan(a)) return 0; F32 r = floorf(a); return r <= 0.f ? 0u : r >= 4294967296.f ? 0xffffffffu : (U32)r; }
++__device__ __inline__ U32   f32_to_u8_sat           (F32 a)                 { if (isnan(a)) return 0; F32 r = rintf(a); return r <= 0.f ? 0u : r >= 255.f ? 255u : (U32)r; }
++__device__ __inline__ S64   f32_to_s64              (F32 a)                 { return (S64)llrintf(a); }
++__device__ __inline__ S32   add_s16lo_s16lo         (S32 a, S32 b)          { return nvdr_s16lo(a) + nvdr_s16lo(b); }
++__device__ __inline__ S32   add_s16hi_s16lo         (S32 a, S32 b)          { return nvdr_s16hi(a) + nvdr_s16lo(b); }
++__device__ __inline__ S32   add_s16lo_s16hi         (S32 a, S32 b)          { return nvdr_s16lo(a) + nvdr_s16hi(b); }
++__device__ __inline__ S32   add_s16hi_s16hi         (S32 a, S32 b)          { return nvdr_s16hi(a) + nvdr_s16hi(b); }
++__device__ __inline__ S32   sub_s16lo_s16lo         (S32 a, S32 b)          { return nvdr_s16lo(a) - nvdr_s16lo(b); }
++__device__ __inline__ S32   sub_s16hi_s16lo         (S32 a, S32 b)          { return nvdr_s16hi(a) - nvdr_s16lo(b); }
++__device__ __inline__ S32   sub_s16lo_s16hi         (S32 a, S32 b)          { return nvdr_s16lo(a) - nvdr_s16hi(b); }
++__device__ __inline__ S32   sub_s16hi_s16hi         (S32 a, S32 b)          { return nvdr_s16hi(a) - nvdr_s16hi(b); }
++__device__ __inline__ S32   sub_u16lo_u16lo         (U32 a, U32 b)          { return (S32)(a & 0xffffu) - (S32)(b & 0xffffu); }
++__device__ __inline__ S32   sub_u16hi_u16lo         (U32 a, U32 b)          { return (S32)(a >> 16) - (S32)(b & 0xffffu); }
++__device__ __inline__ S32   sub_u16lo_u16hi         (U32 a, U32 b)          { return (S32)(a & 0xffffu) - (S32)(b >> 16); }
++__device__ __inline__ S32   sub_u16hi_u16hi         (U32 a, U32 b)          { return (S32)(a >> 16) - (S32)(b >> 16); }
++__device__ __inline__ U32   add_b0                  (U32 a, U32 b)          { return nvdr_byte(a, 0) + b; }
++__device__ __inline__ U32   add_b1                  (U32 a, U32 b)          { return nvdr_byte(a, 1) + b; }
++__device__ __inline__ U32   add_b2                  (U32 a, U32 b)          { return nvdr_byte(a, 2) + b; }
++__device__ __inline__ U32   add_b3                  (U32 a, U32 b)          { return nvdr_byte(a, 3) + b; }
++__device__ __inline__ U32   vmad_b0                 (U32 a, U32 b, U32 c)   { return nvdr_byte(a, 0) * b + c; }
++__device__ __inline__ U32   vmad_b1                 (U32 a, U32 b, U32 c)   { return nvdr_byte(a, 1) * b + c; }
++__device__ __inline__ U32   vmad_b2                 (U32 a, U32 b, U32 c)   { return nvdr_byte(a, 2) * b + c; }
++__device__ __inline__ U32   vmad_b3                 (U32 a, U32 b, U32 c)   { return nvdr_byte(a, 3) * b + c; }
++__device__ __inline__ U32   vmad_b0_b3              (U32 a, U32 b, U32 c)   { return nvdr_byte(a, 0) * nvdr_byte(b, 3) + c; }
++__device__ __inline__ U32   vmad_b1_b3              (U32 a, U32 b, U32 c)   { return nvdr_byte(a, 1) * nvdr_byte(b, 3) + c; }
++__device__ __inline__ U32   vmad_b2_b3              (U32 a, U32 b, U32 c)   { return nvdr_byte(a, 2) * nvdr_byte(b, 3) + c; }
++__device__ __inline__ U32   vmad_b3_b3              (U32 a, U32 b, U32 c)   { return nvdr_byte(a, 3) * nvdr_byte(b, 3) + c; }
++__device__ __inline__ U32   add_mask8               (U32 a, U32 b)          { return (a + b) & 0xffu; }
++__device__ __inline__ U32   sub_mask8               (U32 a, U32 b)          { return (a - b) & 0xffu; }
++__device__ __inline__ S32   max_max                 (S32 a, S32 b, S32 c)   { return ::max(::max(a, b), c); }
++__device__ __inline__ S32   min_min                 (S32 a, S32 b, S32 c)   { return ::min(::min(a, b), c); }
++__device__ __inline__ S32   max_add                 (S32 a, S32 b, S32 c)   { return ::max(a, b) + c; }
++__device__ __inline__ S32   min_add                 (S32 a, S32 b, S32 c)   { return ::min(a, b) + c; }
++__device__ __inline__ U32   add_add                 (U32 a, U32 b, U32 c)   { return a + b + c; }
++__device__ __inline__ U32   sub_add                 (U32 a, U32 b, U32 c)   { return a - b + c; }
++__device__ __inline__ U32   add_sub                 (U32 a, U32 b, U32 c)   { return a - c + b; }   // PTX operand order (a, c, b)
++__device__ __inline__ S32   add_clamp_0_x           (S32 a, S32 b, S32 c)   { S64 t = (S64)a + b; U32 s = t <= 0 ? 0u : t >= 0xffffffffLL ? 0xffffffffu : (U32)t; return (S32)::min(s, (U32)c); }
++__device__ __inline__ S32   add_clamp_b0            (S32 a, S32 b, S32 c)   { S64 t = (S64)a + b; U32 s = t <= 0 ? 0u : t >= 255 ? 255u : (U32)t; return (S32)(((U32)c & ~0xffu) | s); }
++__device__ __inline__ S32   add_clamp_b2            (S32 a, S32 b, S32 c)   { S64 t = (S64)a + b; U32 s = t <= 0 ? 0u : t >= 255 ? 255u : (U32)t; return (S32)(((U32)c & ~0x00ff0000u) | (s << 16)); }
++__device__ __inline__ U32   prmt                    (U32 a, U32 b, U32 c)   { return __byte_perm(a, b, c); }
++__device__ __inline__ S32   u32lo_sext              (U32 a)                 { return (S32)(S16)(a & 0xffffu); }
++__device__ __inline__ U32   slct                    (U32 a, U32 b, S32 c)   { return c >= 0 ? a : b; }
++__device__ __inline__ S32   slct                    (S32 a, S32 b, S32 c)   { return c >= 0 ? a : b; }
++__device__ __inline__ F32   slct                    (F32 a, F32 b, S32 c)   { return c >= 0 ? a : b; }
++__device__ __inline__ U32   isetge                  (S32 a, S32 b)          { return a >= b ? 0xffffffffu : 0u; }
++__device__ __inline__ F64   rcp_approx              (F64 a)                 { return 1.0 / a; }
++__device__ __inline__ F32   fma_rm                  (F32 a, F32 b, F32 c)   { return __ocml_fma_rtn_f32(a, b, c); }
++__device__ __inline__ bool  singleLane              (void)                  { return ((::__ballot_sync(~0u, true) & getLaneMaskLt()) == 0); }
++__device__ __inline__ void  add_add_carry           (U32& rlo, U32 alo, U32 blo, U32& rhi, U32 ahi, U32 bhi) { U64 r = combineLoHi(alo, ahi) + combineLoHi(blo, bhi); rlo = getLo(r); rhi = getHi(r); }
++#else
+ __device__ __inline__ U32   getLaneMaskLt           (void)                  { U32 r; asm("mov.u32 %0, %lanemask_lt;" : "=r"(r)); return r; }
+ __device__ __inline__ U32   getLaneMaskLe           (void)                  { U32 r; asm("mov.u32 %0, %lanemask_le;" : "=r"(r)); return r; }
+ __device__ __inline__ U32   getLaneMaskGt           (void)                  { U32 r; asm("mov.u32 %0, %lanemask_gt;" : "=r"(r)); return r; }
+@@ -77,6 +139,7 @@ __device__ __inline__ F32   slct                    (F32 a, F32 b, S32 c)   { F3
+ __device__ __inline__ U32   isetge                  (S32 a, S32 b)          { U32 v; asm("set.ge.u32.s32 %0, %1, %2;" : "=r"(v) : "r"(a), "r"(b)); return v; }
+ __device__ __inline__ F64   rcp_approx              (F64 a)                 { F64 v; asm("rcp.approx.ftz.f64 %0, %1;" : "=d"(v) : "d"(a)); return v; }
+ __device__ __inline__ F32   fma_rm                  (F32 a, F32 b, F32 c)   { F32 v; asm("fma.rm.f32 %0, %1, %2, %3;" : "=f"(v) : "f"(a), "f"(b), "f"(c)); return v; }
++#endif
+ __device__ __inline__ U32   idiv_fast               (U32 a, U32 b);
+ 
+ __device__ __inline__ uint3 setupPleq               (float3 values, int2 v0, int2 d1, int2 d2, F32 areaRcp);
+diff --git a/csrc/common/framework.h b/csrc/common/framework.h
+index 8407860..63b555c 100644
+--- a/csrc/common/framework.h
++++ b/csrc/common/framework.h
+@@ -16,9 +16,17 @@
+ #ifdef NVDR_TORCH
+ #ifndef __CUDACC__
+ #include <torch/extension.h>
++#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)  // ROCm port: same API, HIP headers
++#include <ATen/hip/HIPContext.h>
++#include <ATen/hip/HIPUtils.h>
++#include <c10/hip/HIPGuard.h>
++#define cudaError_t hipError_t            // used by NVDR_CHECK_CUDA_ERROR in files hipify skips
++#define cudaGetLastError hipGetLastError
++#else
+ #include <ATen/cuda/CUDAContext.h>
+ #include <ATen/cuda/CUDAUtils.h>
+ #include <c10/cuda/CUDAGuard.h>
++#endif
+ #include <pybind11/numpy.h>
+ #endif
+ #define NVDR_CHECK(COND, ERR) do { TORCH_CHECK(COND, ERR) } while(0)
+diff --git a/csrc/common/hip_compat.h b/csrc/common/hip_compat.h
+new file mode 100644
+index 0000000..8744fcc
+--- /dev/null
++++ b/csrc/common/hip_compat.h
+@@ -0,0 +1,21 @@
++// ROCm/HIP compatibility for nvdiffrast (local port for gfx1151; not upstream).
++// Force-included into every HIP compile by setup.py (-include), because several kernels never include framework.h.
++// HIP's warp-sync intrinsics require 64-bit lane masks and return 64-bit ballots. This GPU runs 32-wide
++// waves, so the CUDA code's 32-bit masks are exact: widen them going in, narrow ballots coming out.
++#pragma once
++#if defined(__HIP__) || defined(__HIPCC__)  // device helpers: only in HIP compiles (clang -x hip), not g++ host-only .cpp
++#include <hip/hip_runtime.h>
++template<typename M> __device__ __forceinline__ unsigned int nvdr_ballot(M m, int p)     { return (unsigned int)__ballot_sync((unsigned long long)(unsigned int)m, p); }
++template<typename M> __device__ __forceinline__ int          nvdr_any(M m, int p)        { return __any_sync((unsigned long long)(unsigned int)m, p); }
++template<typename M> __device__ __forceinline__ int          nvdr_all(M m, int p)        { return __all_sync((unsigned long long)(unsigned int)m, p); }
++template<typename M, typename T> __device__ __forceinline__ unsigned int nvdr_match_any(M m, T v) { return (unsigned int)__match_any_sync((unsigned long long)(unsigned int)m, v); }
++__device__ __forceinline__ void nvdr_syncwarp() { __syncwarp(0xffffffffull); }
++template<typename M> __device__ __forceinline__ void nvdr_syncwarp(M m) { __syncwarp((unsigned long long)(unsigned int)m); }
++#define __ballot_sync    nvdr_ballot
++#define __any_sync       nvdr_any
++#define __all_sync       nvdr_all
++#define __match_any_sync nvdr_match_any
++#define __syncwarp       nvdr_syncwarp
++// No round-toward-zero reciprocal on AMD; round-to-nearest differs by at most 1 ulp (texture LOD math).
++#define __frcp_rz __frcp_rn
++#endif  // __HIP__
+diff --git a/setup.py b/setup.py
+index 1c604e6..4301179 100644
+--- a/setup.py
++++ b/setup.py
+@@ -22,6 +22,11 @@ except ImportError:
+     print("*" * 70 + "\n\n")
+     exit(1)
+ 
++import glob, shutil, torch
++if torch.version.hip:  # ROCm port: hipify renames cudaraster/ -> hipraster/ but does not convert .inl files
++    _dst = "csrc/common/hipraster/impl"; os.makedirs(_dst, exist_ok=True)
++    for _f in glob.glob("csrc/common/cudaraster/impl/*.inl"): shutil.copy(_f, _dst)
++
+ setuptools.setup(
+     ext_modules=[
+         CUDAExtension(
+@@ -47,7 +52,7 @@ setuptools.setup(
+                 "cxx": ["-DNVDR_TORCH"]
+                 # Disable warnings in torch headers.
+                 + (["/wd4067", "/wd4624", "/wd4996"] if os.name == "nt" else []),
+-                "nvcc": ["-DNVDR_TORCH", "-lineinfo"],
++                "nvcc": ["-DNVDR_TORCH", "-lineinfo"] + (["-include", os.path.abspath("csrc/common/hip_compat.h")] if torch.version.hip else []),
+             },
+         )
+     ],

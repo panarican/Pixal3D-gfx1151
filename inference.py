@@ -9,8 +9,8 @@ from PIL import Image
 
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
 # expandable_segments reduces fragmentation on both CUDA and ROCm allocators
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["PYTORCH_HIP_ALLOC_CONF"]  = "expandable_segments:True"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # overridable: off on ROCm (env.sh)
+os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True")  # overridable: off on ROCm (env.sh)
 # Enable AOTriton-backed flash / memory-efficient attention on AMD gfx1xxx GPUs.
 # Without this flag PyTorch SDPA silently falls back to the O(N²) math kernel.
 os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
@@ -351,6 +351,11 @@ def run_inference(
     # Extract GLB
     print("[Inference] Extracting GLB...")
     _t = time.perf_counter()
+    # Hand PyTorch's cached GPU memory back before the export: CuMesh/o_voxel allocate with hipMalloc/cudaMalloc
+    # directly, and on ROCm with expandable_segments the runtime counts PyTorch's reservations as used, so
+    # those raw allocations failed ("invalid argument" in CuMesh io.hip) with most of the GPU physically free.
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
     if dc_resolution is not None:
         os.environ["DC_RESOLUTION"] = str(dc_resolution)
     glb = o_voxel.postprocess.to_glb(
